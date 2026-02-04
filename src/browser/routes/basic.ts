@@ -71,9 +71,11 @@ export function registerBrowserBasicRoutes(app: BrowserRouteRegistrar, ctx: Brow
       attachOnly: current.resolved.attachOnly,
     });
   });
+// 🔒 VOTAL.AI Security Fix: Missing authentication/authorization on privileged browser control endpoints [CWE-306] - CRITICAL
 
   // Start browser (profile-aware)
   app.post("/start", async (req, res) => {
+    if (process.env.BROWSER_CONTROL_TOKEN && req.query.token !== process.env.BROWSER_CONTROL_TOKEN) return jsonError(res, 401, "unauthorized"); // authz guard
     const profileCtx = getProfileContext(req, ctx);
     if ("error" in profileCtx) {
       return jsonError(res, profileCtx.status, profileCtx.error);
