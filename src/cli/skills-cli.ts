@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type { Command } from "commander";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import {
@@ -26,6 +27,138 @@ export type SkillInfoOptions = {
 export type SkillsCheckOptions = {
   json?: boolean;
 };
+
+type CliErrorOutputOptions = {
+  json?: boolean;
+};
+
+function envFlagEnabled(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function isDebugEnabled(): boolean {
+  // SECURITY: Only emit verbose internal errors (stack traces, absolute paths, etc.) when explicitly requested.
+  // This prevents inadvertent information disclosure in normal CLI usage (CWE-209).
+  if (envFlagEnabled(process.env.OPENCLAW_DEBUG)) return true;
+  if (envFlagEnabled(process.env.CLAW_DEBUG)) return true;
+
+  // Common Node convention: DEBUG="*" or DEBUG="openclaw*"
+  const debug = process.env.DEBUG;
+  if (!debug) return false;
+  if (debug.trim() === "*") return true;
+  return debug.split(",").some((token) => token.trim().startsWith("openclaw"));
+}
+
+function redactAbsolutePath(p: string): string {
+  const isWin = /^[A-Za-z]:\\/.test(p);
+  const base = isWin ? path.win32.basename(p) : path.posix.basename(p);
+  const sep = isWin ? "\\" : "/";
+  // Avoid returning an empty string (e.g., path ends with a separator); still keep a non-sensitive placeholder.
+  return base ? `…${sep}${base}` : "…";
+}
+
+function redactPaths(text: string): string {
+  let out = text;
+
+  // Redact absolute paths commonly present in Node error messages (often quoted).
+  out = out.replace(
+    /(['"])((?:[A-Za-z]:\\|\/)[^'"\r\n]+)\1/g,
+    (_m: string, quote: string, p: string) => `${quote}${redactAbsolutePath(p)}${quote}`,
+  );
+
+  // Redact unquoted Windows absolute paths.
+  out = out.replace(
+    /\b([A-Za-z]:\\(?:[^\s'"`<>|]+\\)*[^\s'"`<>|]+)\b/g,
+    (_m: string, p: string) => redactAbsolutePath(p),
+  );
+
+  // Redact unquoted Unix absolute paths with at least two segments (e.g., /a/b, /a/b/c).
+  out = out.replace(
+    /(^|[\s(])((?:\/[^/\s'"`<>|]+){2,})/g,
+    (_m: string, prefix: string, p: string) => `${prefix}${redactAbsolutePath(p)}`,
+  );
+
+  // Redact file:// URIs (common in some stacks/errors).
+  out = out.replace(/file:\/\/\/([^\s'"`<>|]+)/g, (_m: string, p: string) => {
+    const normalized = p.startsWith("/") ? p : `/${p}`;
+    return `file://${redactAbsolutePath(normalized)}`;
+  });
+
+  return out;
+}
+
+function toSingleLine(text: string): string {
+  return text.replace(/[\r\n]+/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
+function formatPublicErrorMessage(err: unknown): string {
+  // SECURITY: Provide a minimal, sanitized message for normal CLI output.
+  // Do not include stacks or raw error serialization, as those frequently contain absolute paths.
+  let message = "";
+
+  if (err instanceof Error) {
+    message = err.message || err.name || "Unknown error";
+  } else if (typeof err === "string") {
+    message = err;
+  } else if (err && typeof err === "object") {
+    // Avoid JSON.stringify which may include internal properties; prefer a generic label.
+    message = "Unexpected error";
+  } else {
+    message = "Unexpected error";
+  }
+
+  message = toSingleLine(message);
+  message = redactPaths(message);
+  message = truncate(message, 400);
+
+  return message;
+}
+
+function formatFullError(err: unknown): string {
+  if (err instanceof Error) {
+    return err.stack || `${err.name}: ${err.message}`;
+  }
+  return typeof err === "string" ? err : String(err);
+}
+
+function handleCliError(err: unknown, context: string, opts?: CliErrorOutputOptions): void {
+  const debug = isDebugEnabled();
+  const publicMessage = formatPublicErrorMessage(err);
+
+  if (opts?.json) {
+    // Keep error output parseable for tooling; do not leak sensitive details unless debug is enabled.
+    const payload: Record<string, unknown> = {
+      error: context,
+      message: publicMessage || "Unexpected error",
+    };
+    if (debug) {
+      payload.details = formatFullError(err);
+    }
+    defaultRuntime.error(JSON.stringify(payload, null, 2));
+    defaultRuntime.exit(1);
+    return;
+  }
+
+  // Human output: show context + sanitized message. Avoid stack traces by default (CWE-209).
+  const base = publicMessage ? `${context}: ${publicMessage}` : context;
+  defaultRuntime.error(theme.error(base));
+
+  // Provide an explicit opt-in path to more diagnostics without leaking by default.
+  if (debug) {
+    defaultRuntime.error(formatFullError(err));
+  } else {
+    defaultRuntime.error(theme.muted("Hint: set OPENCLAW_DEBUG=1 to see more details."));
+  }
+
+  defaultRuntime.exit(1);
+}
 
 function appendClawHubHint(output: string, json?: boolean): string {
   if (json) {
@@ -229,6 +362,7 @@ export function formatSkillInfo(
     }
     if (skill.requirements.config.length > 0) {
       const configStatus = skill.requirements.config.map((cfg) => {
+// 🔒 VOTAL.AI Security Fix: Information disclosure via verbose error output to CLI [CWE-209] - LOW
         const missing = skill.missing.config.includes(cfg);
         return missing ? theme.error(`✗ ${cfg}`) : theme.success(`✓ ${cfg}`);
       });
@@ -362,8 +496,7 @@ export function registerSkillsCli(program: Command) {
         const report = buildWorkspaceSkillStatus(workspaceDir, { config });
         defaultRuntime.log(formatSkillsList(report, opts));
       } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
+        handleCliError(err, "Failed to list skills", { json: opts?.json });
       }
     });
 
@@ -379,8 +512,7 @@ export function registerSkillsCli(program: Command) {
         const report = buildWorkspaceSkillStatus(workspaceDir, { config });
         defaultRuntime.log(formatSkillInfo(report, name, opts));
       } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
+        handleCliError(err, "Failed to show skill info", { json: opts?.json });
       }
     });
 
@@ -395,8 +527,7 @@ export function registerSkillsCli(program: Command) {
         const report = buildWorkspaceSkillStatus(workspaceDir, { config });
         defaultRuntime.log(formatSkillsCheck(report, opts));
       } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
+        handleCliError(err, "Failed to check skills", { json: opts?.json });
       }
     });
 
@@ -408,8 +539,7 @@ export function registerSkillsCli(program: Command) {
       const report = buildWorkspaceSkillStatus(workspaceDir, { config });
       defaultRuntime.log(formatSkillsList(report, {}));
     } catch (err) {
-      defaultRuntime.error(String(err));
-      defaultRuntime.exit(1);
+      handleCliError(err, "Failed to list skills");
     }
   });
 }
