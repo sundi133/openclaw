@@ -982,6 +982,13 @@ function applyPluginSchemas(schema: ConfigSchema, plugins: PluginUiMetadata[]): 
     if (!plugin.configSchema) {
       continue;
     }
+    if (
+      plugin.id === "__proto__" ||
+      plugin.id === "prototype" ||
+      plugin.id === "constructor"
+    ) {
+      continue;
+    }
     const entrySchema = entryBase
       ? cloneSchema(entryBase)
       : ({ type: "object" } as JsonSchemaObject);
